@@ -1,0 +1,281 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Phake, a crap version of database migrations.
+ */
+
+class Phake
+{
+    protected static $db;
+
+    public static function query ( $sql )
+    {
+        return self::$db->query($sql);
+    }
+}
+
+abstract class PhakeMigration
+{
+    protected function query($sql)
+    {
+        return Phake::query($sql);
+    }
+    
+    abstract public function up ();
+    abstract public function down ();
+}
+
+class PhakeIrreversibleMigration extends Exception {}
+
+function next_largest ( Array $arr, $index )
+{
+    $arr = array_keys($arr);
+    sort($arr);
+    $i = end($arr);
+    while($index <= $i){
+        $i = prev($arr);
+    }
+    return $i;
+}
+
+// Main
+
+error_reporting(E_ALL ^ E_NOTICE);
+
+$shortopts  = "c:"; // config
+$shortopts .= "v:"; //version
+$shortopts .= 'f';  // force
+$shortopts .= 'q';  // quiet
+
+$longopts = array(
+    'config:',
+    'version:',
+    'force',
+    'quiet'
+);
+
+$options = getopt($shortopts,$longopts);
+
+$config_file = $options['config'] ? $options['config'] : 'Phakefile';
+
+if(!file_exists($config_file)){
+    die(sprintf("ERROR: Config file (%s) not found!".PHP_EOL,$config_file));
+}
+
+$config = parse_ini_file($config_file);
+
+if(isset($options['f'])||isset($options['force'])){
+    $force = true;
+} else {
+    $force = false;
+}
+
+$phake_table = $config['table'] ? $config['table'] : 'phake';
+$phake_version = $config['version'] ? $config['version'] : 'version';
+
+switch(strtolower($config['type'])){
+    case 'mysql':
+        require_once 'sqls/Phake_Translator_MySQL.php';
+        $translator = new Phake_Translator_MySQL;
+        switch(strtolower($config['connector'])){
+            case 'pdo':
+                $db = new PDO("mysql:host={$config['host']};dbname={$config['database']}",
+                              $config['username'],
+                              $config['password']);
+                break;
+            case 'mysqli':
+                $db = new mysqli($config['host'],$config['username'],$config['password'],$config['database']);
+                break;
+        }
+        break;
+} // $config['type']
+
+function get_migrations () 
+{
+    $migrations = glob('migrations/*.php');
+    $versions = array();
+
+    foreach ( $migrations as $m )
+    {
+        $v = array();
+        $v['file'] = $m;
+        $fn = basename($m);
+        preg_match('/^(\d+)_([\w_]+)\.php$/',$fn,$parts);
+        
+        $name = ucfirst($parts[2]);
+        $name = preg_replace('/_([a-z])/e','strtoupper("$1")',$name);
+        $v['class'] = $name;
+    
+        $versions[intval($parts[1])] = $v;
+    }
+
+    ksort($versions);
+
+    return $versions;
+}
+
+function query ( $sql )
+{
+    global $db;
+}
+
+function create_table ( $name, Array $structure, Array $options = NULL )
+{
+    global $translator,$db;
+    $db->query($translator->create_table($name,$structure,$options));
+}
+
+function drop_table ( $name )
+{
+    global $translator,$db;
+    $db->query($translator->drop_table($name));
+}
+
+function insert_or_update ( $table, Array $data, Array $compare )
+{
+    global $translator, $db;
+    $res = $db->query($translator->select($table,array_keys($compare),$compare));
+    if($res->num_rows||$res->rowCount){
+        $res = $db->query($translator->update($table,$data,$compare));
+    }else{
+        $db->query($translator->insert($table,$data));
+    }
+}
+
+function insert ( $table, Array $data )
+{
+    global $translator, $db;
+    $res = $db->query($translator->insert($table,$data));
+}
+
+function update ( $table, Array $data, $where = NULL )
+{
+    global $translator,$db;
+    $res = $db->query($translator->update($table,$data,$where));
+}
+
+function select ( $from, $what, Array $where = NULL, Array $orderby = NULL, $limit = false )
+{
+    global $translator,$db;
+    $res = $db->query($translator->select($from,$what,$where,$orderby,$limit));
+    if($res instanceof PDOStatement){
+        return $res->fetchAll(PDO::FETCH_ASSOC);
+    }else{
+        $rows = array();
+        while($rows[]=$res->fetch_assoc());
+        return $rows;
+    }
+}
+
+$versions = get_migrations();
+
+create_table($phake_table,array('name'=>array('type'=>'string','unique'=>true),'value'=>'string'));
+$settings = select($phake_table,'value',array('name'=>$phake_version));
+if($settings[0]){
+    $source = $settings[0]['value'];
+}else{
+    $source = 0;
+    insert($phake_table,array('name'=>$phake_version,'value'=>$source));
+}
+
+if(in_array('now',$argv)) {
+    printf("Current version is: %d".PHP_EOL,$source);
+    exit;
+} else if (in_array('create',$argv)) {
+    $name = end($argv);
+    $class = preg_replace('/_([a-z])/ie','strtoupper("$1")',ucfirst($name));
+    $next = max(array_keys(get_migrations()))+1;
+    file_put_contents(sprintf('migrations/%03d_%s.php',$next,$name),
+"<?php
+
+class $class extends PhakeMigration
+{
+    public function up ()
+    {
+        
+    }
+
+    public function down ()
+    {
+        
+    }
+}
+
+");
+    exit;
+}
+
+$destination = ctype_digit($options['version']) 
+                ? intval($options['version']) 
+                : max(array_keys($versions));
+
+$count=0;
+
+if($destination>$source) {
+
+    foreach($versions as $i => $v)
+    {
+        if($i<=$source||$i>$destination) continue;
+    
+        if(!file_exists($v['file'])){
+            die(sprintf("ERROR: Migration file (%s) not found!".PHP_EOL,$v['file']));
+        }
+    
+        require_once $v['file'];
+    
+        if(!class_exists($v['class'])){
+            die(sprintf("ERROR: Migration (%s) not defined!".PHP_EOL,$v['class']));
+        }
+
+        $m = new $v['class'];
+
+        printf("Executing migration %d: %s...",$i,$v['class']);
+
+        $m->up();
+
+        insert_or_update($phake_table,array('value'=>$i),array('name'=>$phake_version));
+
+        printf("done.".PHP_EOL);
+
+        unset($m);
+        $count++;
+    }
+
+} else if ( $destination < $source ) {
+
+    krsort($versions);
+
+    foreach($versions as $i => $v)
+    {
+
+        if($i>$source||$i<=$destination) continue;
+
+        if(!file_exists($v['file'])){
+            die(sprintf("ERROR: Migration file (%s) not found!".PHP_EOL,$v['file']));
+        }
+
+        require_once $v['file'];
+
+        if(!class_exists($v['class'])){
+            die(sprintf("ERROR: Migration (%s) not defined!".PHP_EOL,$v['class']));
+        }
+
+        $m = new $v['class'];
+
+        printf("Executing migration %d: %s...",$i,$v['class']);
+
+        $m->down();
+
+        insert_or_update($phake_table,array('value'=>next_largest($versions,$i)),array('name'=>$phake_version));
+
+        printf("done.".PHP_EOL);
+
+        unset($m);
+        $count++;
+    }
+} else {
+    die(sprintf("NOTICE: Already at version (%d)".PHP_EOL,$destination));
+}
+
+printf("NOTICE: %d migrations completed successfully.".PHP_EOL,$count);
+
